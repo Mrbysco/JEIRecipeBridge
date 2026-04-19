@@ -13,6 +13,8 @@ import net.minecraft.world.item.crafting.Recipe;
 import net.minecraft.world.item.crafting.RecipeHolder;
 import net.minecraft.world.item.crafting.RecipeSerializer;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -28,10 +30,37 @@ public record FabricRecipeSyncPayload(List<Entry> entries) implements CustomPack
 	}
 
 	public record Entry(RecipeSerializer<?> serializer, List<RecipeHolder<?>> recipes) {
+		private static final Method STREAM_CODEC_METHOD = resolveStreamCodecMethod();
+
 		public static final StreamCodec<RegistryFriendlyByteBuf, Entry> CODEC = StreamCodec.ofMember(
 				Entry::write,
 				Entry::read
 		);
+
+		private static Method resolveStreamCodecMethod() {
+			try {
+				return RecipeSerializer.class.getMethod("streamCodec");
+			} catch (NoSuchMethodException exception) {
+				throw new ExceptionInInitializerError(exception);
+			}
+		}
+
+		@SuppressWarnings("unchecked")
+		private static StreamCodec<RegistryFriendlyByteBuf, Recipe<?>> recipeStreamCodec(RecipeSerializer<?> serializer) {
+			try {
+				Object codec = STREAM_CODEC_METHOD.invoke(serializer);
+				if (codec instanceof StreamCodec<?, ?> streamCodec) {
+					return (StreamCodec<RegistryFriendlyByteBuf, Recipe<?>>) streamCodec;
+				}
+			} catch (IllegalAccessException exception) {
+				throw new IllegalStateException("Cannot access stream codec for recipe serializer '" + BuiltInRegistries.RECIPE_SERIALIZER.getKey(serializer) + "'", exception);
+			} catch (InvocationTargetException exception) {
+				Throwable cause = exception.getCause() != null ? exception.getCause() : exception;
+				throw new IllegalStateException("Cannot get stream codec for recipe serializer '" + BuiltInRegistries.RECIPE_SERIALIZER.getKey(serializer) + "'", cause);
+			}
+
+			throw new IllegalStateException("Recipe serializer '" + BuiltInRegistries.RECIPE_SERIALIZER.getKey(serializer) + "' returned an invalid stream codec");
+		}
 
 		private static Entry read(RegistryFriendlyByteBuf buf) {
 			Identifier recipeSerializerId = buf.readIdentifier();
@@ -46,8 +75,7 @@ public record FabricRecipeSyncPayload(List<Entry> entries) implements CustomPack
 
 			for (int i = 0; i < count; i++) {
 				ResourceKey<Recipe<?>> id = buf.readResourceKey(Registries.RECIPE);
-				//noinspection deprecation
-				Recipe<?> recipe = recipeSerializer.streamCodec().decode(buf);
+				Recipe<?> recipe = recipeStreamCodec(recipeSerializer).decode(buf);
 				list.add(new RecipeHolder<>(id, recipe));
 			}
 
@@ -59,8 +87,7 @@ public record FabricRecipeSyncPayload(List<Entry> entries) implements CustomPack
 
 			buf.writeVarInt(this.recipes.size());
 
-			//noinspection unchecked,deprecation
-			StreamCodec<RegistryFriendlyByteBuf, Recipe<?>> serializer = ((StreamCodec<RegistryFriendlyByteBuf, Recipe<?>>) this.serializer.streamCodec());
+			StreamCodec<RegistryFriendlyByteBuf, Recipe<?>> serializer = recipeStreamCodec(this.serializer);
 
 			for (RecipeHolder<?> recipe : this.recipes) {
 				buf.writeResourceKey(recipe.id());

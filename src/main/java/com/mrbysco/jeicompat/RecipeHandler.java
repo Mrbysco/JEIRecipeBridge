@@ -1,8 +1,13 @@
 package com.mrbysco.jeicompat;
 
 import com.mrbysco.jeicompat.compat.fabric.FabricRecipeSyncPayload;
+import com.mrbysco.jeicompat.compat.fabric.FabricSupportedRecipeSerializersPayload;
 import com.mrbysco.jeicompat.compat.neoforge.NeoforgeRecipeSyncPayload;
 import io.netty.buffer.Unpooled;
+import io.papermc.paper.connection.PlayerConfigurationConnection;
+import io.papermc.paper.connection.PlayerConnection;
+import io.papermc.paper.event.connection.configuration.PlayerConnectionInitialConfigureEvent;
+import io.papermc.paper.event.connection.configuration.PlayerConnectionReconfigureEvent;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
@@ -22,12 +27,33 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.plugin.messaging.PluginMessageListener;
 
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
-public class RecipeHandler implements Listener {
+public class RecipeHandler implements Listener, PluginMessageListener {
+	private final JEIRecipeBridgePlugin plugin;
+	private final ConcurrentHashMap<UUID, Set<Identifier>> supportedFabricRecipeSerializers = new ConcurrentHashMap<>();
+
+	public RecipeHandler(JEIRecipeBridgePlugin plugin) {
+		this.plugin = plugin;
+	}
+
+	@EventHandler
+	public void onInitialConfigure(PlayerConnectionInitialConfigureEvent event) {
+		clearSupportedFabricRecipeSerializers(event.getConnection());
+	}
+
+	@EventHandler
+	public void onReconfigure(PlayerConnectionReconfigureEvent event) {
+		clearSupportedFabricRecipeSerializers(event.getConnection());
+	}
 
 	@EventHandler
 	public void onJoin(PlayerJoinEvent event) {
@@ -35,42 +61,96 @@ public class RecipeHandler implements Listener {
 		final ServerPlayer player = ((CraftPlayer) originalPlayer).getHandle();
 		final MinecraftServer server = player.level().getServer();
 		final RecipeManager recipeManager = server.getRecipeManager();
-
-		originalPlayer.sendMessage("§6PaperMC JEI Compat: Syncing Recipes...§r");
-
-		RecipeMap recipeMap = recipeManager.recipes;
-
-		RegistryFriendlyByteBuf buffer = new RegistryFriendlyByteBuf(Unpooled.buffer(), server.registryAccess());
-		String brand = originalPlayer.getClientBrandName();
+		final String brand = originalPlayer.getClientBrandName();
 		if (brand == null) {
 			return; // Unknown brand, do not send any custom payload
 		}
-		if (brand.equalsIgnoreCase("fabric")) {
-			sendFabricPayload(player, recipeMap, buffer);
-		} else if (brand.equalsIgnoreCase("neoforge")) {
-			sendNeoForgePayload(player, server, recipeMap, buffer);
+
+		final RecipeMap recipeMap = recipeManager.recipes;
+
+		try {
+			if (brand.equalsIgnoreCase("fabric")) {
+				Set<Identifier> supportedSerializers = this.supportedFabricRecipeSerializers.remove(originalPlayer.getUniqueId());
+				if (sendFabricPayload(player, server, recipeMap, supportedSerializers)) {
+					sendSyncMessage(originalPlayer);
+				}
+			} else if (brand.equalsIgnoreCase("neoforge")) {
+				if (sendNeoForgePayload(player, server, recipeMap)) {
+					sendSyncMessage(originalPlayer);
+				}
+			}
+		} catch (RuntimeException | LinkageError exception) {
+			JEIRecipeBridgePlugin.LOGGER.error("Failed to sync JEI recipes to player '{}' with client brand '{}'", originalPlayer.getName(), brand, exception);
 		}
 	}
 
-	private static void sendNeoForgePayload(ServerPlayer player, MinecraftServer server, RecipeMap recipeMap, RegistryFriendlyByteBuf buffer) {
-		List<RecipeType<?>> allRecipeTypes = BuiltInRegistries.RECIPE_TYPE.stream().toList();
-		var payload = NeoforgeRecipeSyncPayload.create(allRecipeTypes, recipeMap);
-		NeoforgeRecipeSyncPayload.STREAM_CODEC.encode(buffer, payload);
-
-		byte[] bytes = new byte[buffer.writerIndex()];
-		buffer.getBytes(0, bytes);
-
-		sendPayload(player, Identifier.fromNamespaceAndPath("neoforge", "recipe_content"), bytes);
-
-		player.connection.send(new ClientboundUpdateTagsPacket(TagNetworkSerialization.serializeTagsToNetwork(server.registries())));
+	@EventHandler
+	public void onQuit(PlayerQuitEvent event) {
+		this.supportedFabricRecipeSerializers.remove(event.getPlayer().getUniqueId());
 	}
 
-	private static void sendFabricPayload(ServerPlayer player, RecipeMap recipeMap, RegistryFriendlyByteBuf buffer) {
+	@Override
+	public void onPluginMessageReceived(String channel, Player player, byte[] message) {
+		// Fabric sends supported serializers during the configuration phase, before a Bukkit Player exists.
+	}
+
+	@Override
+	public void onPluginMessageReceived(String channel, PlayerConnection connection, byte[] message) {
+		if (!FabricSupportedRecipeSerializersPayload.CHANNEL.equals(channel) || !(connection instanceof PlayerConfigurationConnection configurationConnection)) {
+			return;
+		}
+
+		UUID uniqueId = configurationConnection.getProfile().getId();
+		if (uniqueId == null) {
+			return;
+		}
+
+		this.supportedFabricRecipeSerializers.put(uniqueId, FabricSupportedRecipeSerializersPayload.decode(message));
+	}
+
+	private void clearSupportedFabricRecipeSerializers(PlayerConfigurationConnection connection) {
+		UUID uniqueId = connection.getProfile().getId();
+		if (uniqueId != null) {
+			this.supportedFabricRecipeSerializers.remove(uniqueId);
+		}
+	}
+
+	private void sendSyncMessage(Player player) {
+		if (plugin.getConfig().getBoolean("show-sync-message", false)) {
+			player.sendMessage("JEIRecipeBridge: Syncing recipes...");
+		}
+	}
+
+	private static boolean sendNeoForgePayload(ServerPlayer player, MinecraftServer server, RecipeMap recipeMap) {
+		RegistryFriendlyByteBuf buffer = new RegistryFriendlyByteBuf(Unpooled.buffer(), server.registryAccess());
+		try {
+			List<RecipeType<?>> allRecipeTypes = BuiltInRegistries.RECIPE_TYPE.stream().toList();
+			var payload = NeoforgeRecipeSyncPayload.create(allRecipeTypes, recipeMap);
+			NeoforgeRecipeSyncPayload.STREAM_CODEC.encode(buffer, payload);
+
+			byte[] bytes = new byte[buffer.writerIndex()];
+			buffer.getBytes(0, bytes);
+
+			sendPayload(player, Identifier.fromNamespaceAndPath("neoforge", "recipe_content"), bytes);
+			player.connection.send(new ClientboundUpdateTagsPacket(TagNetworkSerialization.serializeTagsToNetwork(server.registries())));
+			return true;
+		} finally {
+			buffer.release();
+		}
+	}
+
+	private static boolean sendFabricPayload(ServerPlayer player, MinecraftServer server, RecipeMap recipeMap, Set<Identifier> supportedSerializers) {
+		if (supportedSerializers == null || supportedSerializers.isEmpty()) {
+			return false;
+		}
+
 		var list = new ArrayList<FabricRecipeSyncPayload.Entry>();
 		var seen = new HashSet<RecipeSerializer<?>>();
 
 		for (RecipeSerializer<?> serializer : BuiltInRegistries.RECIPE_SERIALIZER) {
 			if (!seen.add(serializer)) continue; // skip duplicates
+			Identifier serializerId = BuiltInRegistries.RECIPE_SERIALIZER.getKey(serializer);
+			if (serializerId == null || !supportedSerializers.contains(serializerId)) continue;
 
 			List<RecipeHolder<?>> recipes = new ArrayList<>();
 			for (RecipeHolder<?> holder : recipeMap.values()) {
@@ -85,13 +165,23 @@ public class RecipeHandler implements Listener {
 			}
 		}
 
-		var payload = new FabricRecipeSyncPayload(list);
-		FabricRecipeSyncPayload.CODEC.encode(buffer, payload);
+		if (list.isEmpty()) {
+			return false;
+		}
 
-		byte[] bytes = new byte[buffer.writerIndex()];
-		buffer.getBytes(0, bytes);
+		RegistryFriendlyByteBuf buffer = new RegistryFriendlyByteBuf(Unpooled.buffer(), server.registryAccess());
+		try {
+			var payload = new FabricRecipeSyncPayload(list);
+			FabricRecipeSyncPayload.CODEC.encode(buffer, payload);
 
-		sendPayload(player, Identifier.fromNamespaceAndPath("fabric", "recipe_sync"), bytes);
+			byte[] bytes = new byte[buffer.writerIndex()];
+			buffer.getBytes(0, bytes);
+
+			sendPayload(player, Identifier.fromNamespaceAndPath("fabric", "recipe_sync"), bytes);
+			return true;
+		} finally {
+			buffer.release();
+		}
 	}
 
 	private static void sendPayload(ServerPlayer player, Identifier id, byte[] bytes) {

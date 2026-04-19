@@ -1,5 +1,6 @@
 package com.mrbysco.jeicompat;
 
+import com.mrbysco.jeicompat.compat.fabric.FabricSupportedRecipeSerializersPayload;
 import org.bukkit.Server;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -14,14 +15,17 @@ public final class JEIRecipeBridgePlugin extends JavaPlugin {
 	@Override
 	public void onEnable() {
 		Plugin = this;
+		saveDefaultConfig();
 
-		getServer().getPluginManager().registerEvents(new RecipeHandler(), this);
+		RecipeHandler recipeHandler = new RecipeHandler(this);
+		getServer().getPluginManager().registerEvents(recipeHandler, this);
 
 		final Server server = getServer();
 		final Messenger messenger = server.getMessenger();
 		// Register plugin channels for outgoing messages with the ids used by NeoForge and Fabric
 		messenger.registerOutgoingPluginChannel(this, "neoforge:recipe_content");
 		messenger.registerOutgoingPluginChannel(this, "fabric:recipe_sync");
+		messenger.registerIncomingPluginChannel(this, FabricSupportedRecipeSerializersPayload.CHANNEL, recipeHandler);
 	}
 
 	@Override
