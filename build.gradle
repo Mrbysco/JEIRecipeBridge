@@ -2,6 +2,8 @@ plugins {
     id 'java'
     id("io.papermc.paperweight.userdev") version "2.0.0-beta.21"
     id("xyz.jpenilla.run-paper") version "3.0.2"
+    id 'net.darkhax.curseforgegradle' version '1.3.33'
+    id 'com.modrinth.minotaur' version "2.+"
 }
 
 group = 'com.mrbysco'
@@ -39,5 +41,35 @@ processResources {
     filteringCharset("UTF-8")
     filesMatching(["plugin.yml", "paper-plugin.yml"]) {
         expand(props)
+    }
+}
+
+def publishJar = tasks.named("jar")
+
+if (System.getenv().CURSEFORGE_KEY) {
+    task curseforge(type: net.darkhax.curseforgegradle.TaskPublishCurseForge) {
+        apiToken = System.getenv().CURSEFORGE_KEY
+
+        def mainFile = upload(project.curseforge_id, publishJar)
+        mainFile.releaseType = 'release'
+        mainFile.addGameVersion("${mc_version}")
+        mainFile.addJavaVersion("Java 25")
+
+        mainFile.changelog = file("$project.rootDir/changelog.md")
+        mainFile.changelogType = 'markdown'
+    }
+}
+
+if (System.getenv().MODRINTH_KEY) {
+    modrinth {
+        token = System.getenv().MODRINTH_KEY
+        projectId = project.modrinth_id
+        versionType = "release"
+        versionName = "${mod_name} ${mc_version}"
+        versionNumber = project.version
+        uploadFile = publishJar
+        changelog = file("$project.rootDir/changelog.md").text
+        gameVersions = ["${mc_version}"]
+        loaders = ["folia", "paper", "purpur"]
     }
 }
