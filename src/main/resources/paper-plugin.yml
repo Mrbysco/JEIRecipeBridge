@@ -1,7 +1,7 @@
 name: JEIRecipeBridge
 version: '${plugin_version}'
 main: com.mrbysco.jeicompat.JEIRecipeBridgePlugin
-api-version: '26.2'
+api-version: '26.3'
 author: "Mrbysco"
 description: "Synchronizes server recipes to the client, enabling JEI support."
 website: "https://www.curseforge.com/minecraft/bukkit-plugins/jei-recipe-bridge"
